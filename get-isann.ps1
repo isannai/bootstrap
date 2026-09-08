@@ -30,6 +30,11 @@
                       probe, no WSL/Docker/GPU. Default when not asked: consumer
     --token=<tok>     GitHub token (only if you hit the anonymous rate limit)
 #>
+# PositionalBinding=$false is what actually makes the --xxx=yyy catcher below
+# work. Without it $Root/$Version/$Role/$Token are positional (0..3), so
+# PowerShell binds "--root=C:\isann" to $Root and "--role=provider" to $Version,
+# and $Rest never receives anything - the catcher becomes dead code.
+[CmdletBinding(PositionalBinding = $false)]
 param(
   [string]$Root,
   [string]$Version,
@@ -58,16 +63,31 @@ $ProgressPreference    = 'SilentlyContinue'   # faster Invoke-WebRequest
 # Install root: ALWAYS prompt on run (Enter accepts the default). --root / $ISANN_ROOT
 # only pre-fill the default. A piped `irm | iex` keeps the console stdin, so
 # Read-Host works; a non-interactive host (CI/service) uses the default silently.
+# Whether we can ask a question at all. [Environment]::UserInteractive returns
+# $true even under `powershell -NonInteractive`, where Read-Host then throws
+# PSInvalidOperationException - and with $ErrorActionPreference='Stop' that kills
+# the install at the very first question instead of falling back to defaults.
+# So the cheap gate is only a hint; Read-Answer's try/catch is the real check.
+# get-isann.sh tests /dev/tty for exactly the same reason.
+function Test-Interactive {
+  if (-not [Environment]::UserInteractive) { return $false }
+  return (-not [Console]::IsInputRedirected)
+}
+function Read-Answer([string]$Prompt, [string]$Default) {
+  try { $a = Read-Host $Prompt } catch { return $Default }
+  if ($a) { return $a }
+  return $Default
+}
+
 $default = if ($Root) { $Root } elseif ($env:ISANN_ROOT) { $env:ISANN_ROOT } else { Join-Path $env:LOCALAPPDATA 'isann' }
-if ([Environment]::UserInteractive) {
+if (Test-Interactive) {
   # Say up front that this is not the only prompt. The download and the service
   # registration sit between the two, so someone who walks away comes back to a
   # question still waiting rather than a finished install.
   Write-Host "This asks you two things: the install folder now, and a wallet passphrase at the end."
   Write-Host "Windows will also raise a UAC prompt when the service is registered."
   Write-Host ""
-  $ans = Read-Host "install folder [$default]"
-  if ($ans) { $Root = $ans } else { $Root = $default }
+  $Root = Read-Answer "install folder [$default]" $default
 } else {
   $Root = $default
 }
@@ -85,12 +105,12 @@ if ([Environment]::UserInteractive) {
 if ($null -eq $Role) { $Role = '' }
 $Role = $Role.Trim().ToLower()
 if ($Role -notin @('consumer', 'provider')) {
-  if ([Environment]::UserInteractive) {
+  if (Test-Interactive) {
     Write-Host ""
     Write-Host "what will this node do?"
     Write-Host "  1) consumer - use other nodes only      (default)"
     Write-Host "  2) provider - also serve inference to others"
-    $ans = Read-Host "choice [1]"
+    $ans = Read-Answer "choice [1]" '1'
     $Role = if ($ans -eq '2') { 'provider' } else { 'consumer' }
   } else {
     $Role = 'consumer'
@@ -111,7 +131,14 @@ function Invoke-Ivm {
 $owner = 'isannai'; $repo = 'isann'
 $api = if ($Version) { "https://api.github.com/repos/$owner/$repo/releases/tags/$Version" }
        else          { "https://api.github.com/repos/$owner/$repo/releases/latest" }
-$headers = @{ 'User-Agent' = 'get-isann' }
+# Two header sets on purpose. browser_download_url 302s to
+# objects.githubusercontent.com, and PowerShell 5.1 forwards Authorization
+# across that redirect - the CDN then rejects the request ("only one auth
+# mechanism allowed"). So the token goes to api.github.com only; the download
+# is public and needs no credential. (curl drops it by itself, which is why
+# get-isann.sh needs no equivalent split.)
+$headers   = @{ 'User-Agent' = 'get-isann' }
+$dlHeaders = @{ 'User-Agent' = 'get-isann' }
 if ($Token) { $headers['Authorization'] = "Bearer $Token" }
 
 Write-Host "==> querying $api"
@@ -124,13 +151,17 @@ Write-Host "==> ivm $tag  ($asset)"
 $tmp = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) ("isann-boot-" + [Guid]::NewGuid().ToString('N')))
 try {
   $zip = Join-Path $tmp $asset
-  Invoke-WebRequest -Uri $a.browser_download_url -Headers $headers -OutFile $zip
+  Invoke-WebRequest -Uri $a.browser_download_url -Headers $dlHeaders -OutFile $zip
 
   if ($a.digest) {
     $want = ($a.digest -replace '^sha256:', '').ToLower()
     $have = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
     if ($want -ne $have) { throw "sha256 mismatch: want $want have $have" }
     Write-Host "==> sha256 ok"
+  } else {
+    # `ivm install` refuses a suite asset with no digest; say so here too rather
+    # than installing an unverified binary in silence.
+    Write-Host "==> WARNING: release ships no sha256 digest for $asset - integrity NOT verified"
   }
   Expand-Archive -Path $zip -DestinationPath $tmp -Force
 
@@ -152,7 +183,27 @@ try {
     Invoke-Ivm init --root $Root                     # anchor the install root explicitly
     Invoke-Ivm install --version $tag                # download + verify + activate
     & $script:ivm service status *> $null
-    if ($LASTEXITCODE -ne 0) { Invoke-Ivm service install }   # register (UAC)
+    if ($LASTEXITCODE -ne 0) {
+      # `ivm service install` opens a UAC window via ShellExecute and returns
+      # IMMEDIATELY - it does not wait for the elevated process, so its exit
+      # code says nothing about whether registration finished. Poll the real
+      # state: `ivm use` right below reads it, and on a miss it silently
+      # degrades to a raw switch and never starts the service.
+      Invoke-Ivm service install
+      $deadline   = (Get-Date).AddSeconds(120)
+      $registered = $false
+      while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 2
+        & $script:ivm service status *> $null
+        if ($LASTEXITCODE -eq 0) { $registered = $true; break }
+      }
+      if (-not $registered) {
+        Write-Host ""
+        Write-Host "service not registered yet (UAC declined, or the elevated window is still open)."
+        Write-Host "Finish that window, then run this installer again - it resumes from here."
+        exit 1
+      }
+    }
     Invoke-Ivm use --version $tag                    # stop -> switch -> start
   } finally { Pop-Location }
 } finally {
@@ -188,9 +239,16 @@ if ($Role -ne 'provider') {
     Write-Host "==> installing OS prereqs (WSL2 + Docker + NVIDIA toolkit)"
     Write-Host "    this asks for admin and may reboot; Docker finishes after the restart."
     & $script:ivm setup
-    if ($LASTEXITCODE -ne 0) {
-      Write-Host "prereqs: setup did not finish - run  ivm setup  again, then  ivm check"
-    }
+    # On Windows `ivm setup` only TRIGGERS the elevated window and returns 0 at
+    # once, so $LASTEXITCODE cannot report whether WSL/Docker finished - and the
+    # first WSL enable needs a reboot anyway. Stop here instead of racing ahead
+    # into mesh pull and the wallet prompt on top of an installer that is still
+    # running in another window. Re-running resumes: everything already done is
+    # skipped and `ivm check` then passes straight through.
+    Write-Host ""
+    Write-Host "==> finish the elevated window first (including any reboot),"
+    Write-Host "    then run this installer again to continue with mesh + wallet."
+    exit 0
   }
 }
 # --- mesh connectors (station, probe) ---
@@ -229,16 +287,15 @@ if ($Role -ne 'provider') {
 # one would be handing out an account nobody can hold. A piped `irm | iex` keeps
 # the console stdin, so the prompt works; a non-interactive host (CI, service)
 # skips this and prints the two commands instead.
-$accounts = Join-Path $Root 'artifactsccounts.json'
+$accounts = Join-Path $Root 'artifacts\accounts.json'
 $hasAccount = (Test-Path $accounts) -and ((Get-Content -Raw $accounts) -match '0x[0-9a-fA-F]{40}')
 
 if ($hasAccount) {
   Write-Host "wallet: already present - skipping"
-} elseif ([Environment]::UserInteractive) {
+} elseif (Test-Interactive) {
   Write-Host ""
   Write-Host "A wallet makes you the owner of this node. Without one the node stays open."
-  $alias = Read-Host "wallet alias [me] (blank to skip)"
-  if ($alias -eq '') { $alias = 'me' }
+  $alias = Read-Answer "wallet alias [me] (type 'skip' to do it later)" 'me'
   if ($alias -ne 'skip') {
     & $script:ivm account create --alias $alias
     if ($LASTEXITCODE -eq 0) {
