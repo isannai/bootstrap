@@ -140,10 +140,23 @@ fi
 
 ( cd "$tmp" && tar xf "$tgz" )   # extract (system tar; exec bit set explicitly below)
 
+# Is the machine-wide isannd service registered for THIS root?
+#
+# Do not key on the exit status alone. ivm <= 0.1.40 prints `not installed`
+# and still exits 0, so a status-only guard reads "already registered", skips
+# `service install`, and the install finishes with no service at all - the
+# node never comes up. Require BOTH a zero exit and the absence of the
+# not-installed wording, so this works on old and fixed ivm.
+service_registered() {
+  out=$("$1" service status 2>&1) || return 1
+  case "$out" in *"not installed"*) return 1 ;; esac
+  return 0
+}
+
 # --- place ivm + scripts, then drive it -----------------------------------
 mkdir -p "$ROOT"
 # Stop a running service before overwriting the binary (avoid a busy-file / live proc).
-if [ -x "$ROOT/ivm" ] && "$ROOT/ivm" service status >/dev/null 2>&1; then
+if [ -x "$ROOT/ivm" ] && service_registered "$ROOT/ivm"; then
   "$ROOT/ivm" service stop || true
 fi
 cp "$tmp/ivm" "$ROOT/ivm"
@@ -154,7 +167,7 @@ chmod +x "$ROOT/ivm"   # the tar.gz is built on Windows (no Unix exec bit) — s
 cd "$ROOT"
 ./ivm init --root "$ROOT"                 # anchor the install root explicitly
 ./ivm install --version "$tag"           # download + verify + activate the suite
-if ! ./ivm service status >/dev/null 2>&1; then
+if ! service_registered ./ivm; then
   ./ivm service install                  # register (self-sudo)
 fi
 ./ivm use --version "$tag"               # stop -> switch -> start

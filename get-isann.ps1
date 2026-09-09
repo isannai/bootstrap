@@ -128,6 +128,18 @@ function Invoke-Ivm {
   if ($LASTEXITCODE -ne 0) { throw "ivm $($args -join ' ') failed (exit $LASTEXITCODE)" }
 }
 
+# Is the machine-wide isannd service registered for THIS root?
+#
+# Do not key on the exit code alone. ivm <= 0.1.40 prints `Task "isannd": not
+# installed` and still exits 0, so an exit-code-only guard reads "already
+# registered", skips `service install`, and the install finishes with no
+# service at all - the node never comes up. Require BOTH a zero exit and the
+# absence of the not-installed wording, so this works on old and fixed ivm.
+function Test-ServiceRegistered {
+  $out = (& $script:ivm service status 2>&1 | Out-String)
+  return ($LASTEXITCODE -eq 0) -and ($out -notmatch 'not installed')
+}
+
 $owner = 'isannai'; $repo = 'isann'
 $api = if ($Version) { "https://api.github.com/repos/$owner/$repo/releases/tags/$Version" }
        else          { "https://api.github.com/repos/$owner/$repo/releases/latest" }
@@ -169,8 +181,7 @@ try {
   New-Item -ItemType Directory -Force -Path $Root | Out-Null
   $script:ivm = Join-Path $Root 'ivm.exe'
   if (Test-Path $script:ivm) {
-    & $script:ivm service status *> $null
-    if ($LASTEXITCODE -eq 0) { & $script:ivm service stop }   # free the busy file
+    if (Test-ServiceRegistered) { & $script:ivm service stop }   # free the busy file
   }
   Copy-Item (Join-Path $tmp 'ivm.exe') $script:ivm -Force
   if (Test-Path (Join-Path $tmp 'scripts')) {
@@ -182,8 +193,7 @@ try {
   try {
     Invoke-Ivm init --root $Root                     # anchor the install root explicitly
     Invoke-Ivm install --version $tag                # download + verify + activate
-    & $script:ivm service status *> $null
-    if ($LASTEXITCODE -ne 0) {
+    if (-not (Test-ServiceRegistered)) {
       # `ivm service install` opens a UAC window via ShellExecute and returns
       # IMMEDIATELY - it does not wait for the elevated process, so its exit
       # code says nothing about whether registration finished. Poll the real
@@ -194,8 +204,7 @@ try {
       $registered = $false
       while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 2
-        & $script:ivm service status *> $null
-        if ($LASTEXITCODE -eq 0) { $registered = $true; break }
+        if (Test-ServiceRegistered) { $registered = $true; break }
       }
       if (-not $registered) {
         Write-Host ""
