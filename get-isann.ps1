@@ -135,7 +135,13 @@ function Invoke-Ivm {
 # registered", skips `service install`, and the install finishes with no
 # service at all - the node never comes up. Require BOTH a zero exit and the
 # absence of the not-installed wording, so this works on old and fixed ivm.
+#
+# Windows PowerShell 5.1 turns each stderr line captured by 2>&1 into an error
+# record (NativeCommandError), and under the script-wide 'Stop' that kills the
+# install - on exactly the fresh machine where status says "not installed" on
+# stderr. Soften it for this probe only (a function-local copy).
 function Test-ServiceRegistered {
+  $ErrorActionPreference = 'Continue'
   $out = (& $script:ivm service status 2>&1 | Out-String)
   return ($LASTEXITCODE -eq 0) -and ($out -notmatch 'not installed')
 }
