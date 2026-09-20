@@ -128,23 +128,12 @@ function Invoke-Ivm {
   if ($LASTEXITCODE -ne 0) { throw "ivm $($args -join ' ') failed (exit $LASTEXITCODE)" }
 }
 
-# Is the machine-wide isannd service registered for THIS root?
-#
-# Do not key on the exit code alone. ivm <= 0.1.40 prints `Task "isannd": not
-# installed` and still exits 0, so an exit-code-only guard reads "already
-# registered", skips `service install`, and the install finishes with no
-# service at all - the node never comes up. Require BOTH a zero exit and the
-# absence of the not-installed wording, so this works on old and fixed ivm.
-#
-# Windows PowerShell 5.1 turns each stderr line captured by 2>&1 into an error
-# record (NativeCommandError), and under the script-wide 'Stop' that kills the
-# install - on exactly the fresh machine where status says "not installed" on
-# stderr. Soften it for this probe only (a function-local copy).
-function Test-ServiceRegistered {
-  $ErrorActionPreference = 'Continue'
-  $out = (& $script:ivm service status 2>&1 | Out-String)
-  return ($LASTEXITCODE -eq 0) -and ($out -notmatch 'not installed')
-}
+# (The Test-ServiceRegistered probe that stood here is gone. It existed so this
+# script could tell "registered" from "not installed" across ivm versions and
+# poll for a registration that happened in a window ivm did not wait for. Both
+# of its callers are gone: `ivm use` now registers + starts in one waited-for
+# elevation, and `ivm doctor` answers the "which install owns the service"
+# question before anything is written.)
 
 $owner = 'isannai'; $repo = 'isann'
 $api = if ($Version) { "https://api.github.com/repos/$owner/$repo/releases/tags/$Version" }
@@ -183,12 +172,33 @@ try {
   }
   Expand-Archive -Path $zip -DestinationPath $tmp -Force
 
+  # --- pre-flight: one machine, one install ---
+  # Run from the TEMP copy, BEFORE the install folder is created and before
+  # anything is written to it - a check that first installs what it is checking
+  # is not a check. It reports every iSANN install on this machine, where the
+  # isannd service points and what PATH resolves, and exits non-zero when they
+  # disagree. Installing into the folder already in use is NOT a conflict, so a
+  # plain upgrade passes straight through. It deletes nothing: an old root can
+  # hold a wallet, so the operator decides.
+  & (Join-Path $tmp 'ivm.exe') doctor --root $Root
+  # EXACTLY 1 is "conflicts found". An ivm older than the one that introduced
+  # `doctor` exits 2 (unknown command) - a pinned --version must still install,
+  # so anything other than 1 carries on.
+  if ($LASTEXITCODE -eq 1) {
+    Write-Host ""
+    Write-Host "install stopped - nothing was installed. Resolve the conflicts above,"
+    Write-Host "or re-run and give the folder this machine already uses."
+    exit 1
+  }
+
   # --- place ivm + scripts ---
   New-Item -ItemType Directory -Force -Path $Root | Out-Null
   $script:ivm = Join-Path $Root 'ivm.exe'
-  if (Test-Path $script:ivm) {
-    if (Test-ServiceRegistered) { & $script:ivm service stop }   # free the busy file
-  }
+  # The old `ivm service stop` that stood here is gone. It ran the SAME ivm.exe
+  # this line is about to overwrite - in an elevated window ivm does not wait
+  # for - so the copy below hit "file in use" depending on how fast UAC was
+  # answered. The service holds isannd.exe, never ivm.exe, and `ivm use` stops
+  # the service itself before swapping bin/.
   Copy-Item (Join-Path $tmp 'ivm.exe') $script:ivm -Force
   if (Test-Path (Join-Path $tmp 'scripts')) {
     Copy-Item (Join-Path $tmp 'scripts') $Root -Recurse -Force
@@ -198,28 +208,17 @@ try {
   Push-Location $Root
   try {
     Invoke-Ivm init --root $Root                     # anchor the install root explicitly
-    Invoke-Ivm install --version $tag                # download + verify + activate
-    if (-not (Test-ServiceRegistered)) {
-      # `ivm service install` opens a UAC window via ShellExecute and returns
-      # IMMEDIATELY - it does not wait for the elevated process, so its exit
-      # code says nothing about whether registration finished. Poll the real
-      # state: `ivm use` right below reads it, and on a miss it silently
-      # degrades to a raw switch and never starts the service.
-      Invoke-Ivm service install
-      $deadline   = (Get-Date).AddSeconds(120)
-      $registered = $false
-      while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds 2
-        if (Test-ServiceRegistered) { $registered = $true; break }
-      }
-      if (-not $registered) {
-        Write-Host ""
-        Write-Host "service not registered yet (UAC declined, or the elevated window is still open)."
-        Write-Host "Finish that window, then run this installer again - it resumes from here."
-        exit 1
-      }
-    }
-    Invoke-Ivm use --version $tag                    # stop -> switch -> start
+    Invoke-Ivm install --version $tag                # download + verify (cache only)
+    # ONE step, ONE UAC prompt: `ivm use` switches and then leaves the node
+    # RUNNING - registering + starting the service when there is none, stopping
+    # and restarting it when there is. ivm now WAITS for its elevated window and
+    # returns its exit code, so a declined UAC fails here instead of leaving the
+    # installer to guess.
+    #
+    # What stood here before: `ivm service install` followed by a 120-second poll
+    # of `service status`, because the elevated window was fire-and-forget and its
+    # result never came back. Both are gone with the wait.
+    Invoke-Ivm use --version $tag                    # switch (+ register) -> running
   } finally { Pop-Location }
 } finally {
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue

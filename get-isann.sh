@@ -141,24 +141,31 @@ fi
 ( cd "$tmp" && tar xf "$tgz" )   # extract (system tar; exec bit set explicitly below)
 
 # Is the machine-wide isannd service registered for THIS root?
-#
-# Do not key on the exit status alone. ivm <= 0.1.40 prints `not installed`
-# and still exits 0, so a status-only guard reads "already registered", skips
-# `service install`, and the install finishes with no service at all - the
-# node never comes up. Require BOTH a zero exit and the absence of the
-# not-installed wording, so this works on old and fixed ivm.
-service_registered() {
-  out=$("$1" service status 2>&1) || return 1
-  case "$out" in *"not installed"*) return 1 ;; esac
-  return 0
-}
+# --- pre-flight: one machine, one install ---------------------------------
+# From the TEMP copy, BEFORE the install folder is touched - a check that first
+# installs what it is checking is not a check. Lists every iSANN install on this
+# machine, where the isannd unit points and what PATH resolves, and exits
+# non-zero when they disagree. Re-installing into the folder already in use is
+# not a conflict. Deletes nothing: an old root can hold a wallet.
+chmod +x "$tmp/ivm" 2>/dev/null || true
+doctor_rc=0
+"$tmp/ivm" doctor --root "$ROOT" || doctor_rc=$?
+# EXACTLY 1 is "conflicts found". An ivm older than the one that introduced
+# `doctor` exits 2 (unknown command) — a pinned --version must still install, so
+# anything other than 1 carries on.
+if [ "$doctor_rc" -eq 1 ]; then
+  echo ""
+  echo "install stopped - nothing was installed. Resolve the conflicts above,"
+  echo "or re-run and give the folder this machine already uses."
+  exit 1
+fi
 
 # --- place ivm + scripts, then drive it -----------------------------------
 mkdir -p "$ROOT"
-# Stop a running service before overwriting the binary (avoid a busy-file / live proc).
-if [ -x "$ROOT/ivm" ] && service_registered "$ROOT/ivm"; then
-  "$ROOT/ivm" service stop || true
-fi
+# No `service stop` here. The unit runs isannd, never ivm, and `ivm use` below
+# stops it itself before swapping bin/ — stopping it here only widened the
+# window in which the node is down (and on Windows the same line deadlocked the
+# copy that follows it).
 cp "$tmp/ivm" "$ROOT/ivm"
 chmod +x "$ROOT/ivm"   # the tar.gz is built on Windows (no Unix exec bit) — set it here.
                        # (the suite that `ivm install` unpacks gets +x via ExtractTarGz)
@@ -167,10 +174,10 @@ chmod +x "$ROOT/ivm"   # the tar.gz is built on Windows (no Unix exec bit) — s
 cd "$ROOT"
 ./ivm init --root "$ROOT"                 # anchor the install root explicitly
 ./ivm install --version "$tag"           # download + verify + activate the suite
-if ! service_registered ./ivm; then
-  ./ivm service install                  # register (self-sudo)
-fi
-./ivm use --version "$tag"               # stop -> switch -> start
+# ONE step: `ivm use` switches and leaves the node RUNNING — it registers and
+# starts the unit when there is none, and stops/restarts it when there is.
+# (The separate `ivm service install` that stood here is gone with that merge.)
+./ivm use --version "$tag"               # switch (+ register) -> running
 
 echo
 echo "iSANN node ready at $ROOT"
