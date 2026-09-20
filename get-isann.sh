@@ -25,6 +25,14 @@
 #   --token=<tok>      GitHub token (only if you hit the anonymous rate limit)
 set -eu
 
+# This script is fetched fresh over the network every run, so the operator has no
+# other way to tell WHICH copy is on screen - a fix pushed minutes ago and a
+# cached copy from this morning look identical while behaving differently. Bump
+# this line in the same commit that changes behaviour. It is the script's own
+# version, unrelated to the ivm/isannd release it installs.
+SCRIPT_VERSION='2026-09-20.4'
+echo "get-isann $SCRIPT_VERSION  (installer script)"
+
 ROOT=""
 VERSION=""
 ROLE="${ISANN_ROLE:-}"

@@ -58,6 +58,14 @@ foreach ($a in $Rest) {
 }
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # faster Invoke-WebRequest
+
+# This script is fetched fresh over the network every run, so the operator has no
+# other way to tell WHICH copy is on screen - a fix pushed minutes ago and a
+# cached copy from this morning look identical while behaving differently. Bump
+# this line in the same commit that changes behaviour. It is the script's own
+# version, unrelated to the ivm/isannd release it installs.
+$ScriptVersion = '2026-09-20.4'
+Write-Host "get-isann $ScriptVersion  (installer script)"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 # Install root: ALWAYS prompt on run (Enter accepts the default). --root / $ISANN_ROOT
