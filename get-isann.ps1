@@ -147,8 +147,8 @@ function Invoke-Ivm {
 $svcExe = $null
 try { $svcExe = (Get-ScheduledTask isannd -ErrorAction SilentlyContinue).Actions[0].Execute } catch { }
 if ($svcExe) {
-  $svcRoot = Split-Path -Parent (Split-Path -Parent $svcExe)   # <root>in\isannd.exe
-  if ($svcRoot.TrimEnd('') -ine $Root.TrimEnd('')) {
+  $svcRoot = Split-Path -Parent (Split-Path -Parent $svcExe)   # <root>\bin\isannd.exe
+  if ($svcRoot.TrimEnd('\') -ine $Root.TrimEnd('\')) {
     Write-Host ""
     Write-Host "This machine already runs an iSANN node from another folder:"
     Write-Host "    service : $svcExe"

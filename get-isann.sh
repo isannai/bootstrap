@@ -114,7 +114,7 @@ gh() {
 # that runs after the download, still before anything is written to $ROOT.
 svc_exe=""
 if command -v systemctl >/dev/null 2>&1; then
-  svc_exe=$(systemctl show -p ExecStart --value isannd 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*//p')
+  svc_exe=$(systemctl show -p ExecStart --value isannd 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p')
 fi
 if [ -n "$svc_exe" ]; then
   svc_root=$(dirname "$(dirname "$svc_exe")")
