@@ -39,16 +39,60 @@ for a in "$@"; do
   esac
 done
 
+# --- where is this machine's iSANN already? --------------------------------
+# Asked BEFORE the folder question, because the answer belongs in the question.
+# Two things name an install without root, without ivm and without a single
+# downloaded byte: the isannd unit and PATH. One iSANN per machine, so if either
+# answers, that folder is the one to offer - typing anything else is a mistake
+# the script would otherwise accept and only refuse several steps later.
+
+# <root>/ivm, or <root>/bin/{isann,isannd}
+install_root() {
+  d=$(dirname "$1")
+  if [ "$(basename "$d")" = "bin" ]; then dirname "$d"; else printf '%s' "$d"; fi
+}
+
+found_root=""
+found_why=""
+note_found() {   # $1 = exe, $2 = label
+  r=$(install_root "$1")
+  case "$found_why" in *"    $2"*) return 0;; esac
+  [ -z "$found_root" ] && found_root="$r"
+  found_why="${found_why}    $2: $1
+"
+}
+
+svc_exe=""
+if command -v systemctl >/dev/null 2>&1; then
+  svc_exe=$(systemctl show -p ExecStart --value isannd 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p')
+fi
+[ -n "$svc_exe" ] && note_found "$svc_exe" "service"
+
+# PATH decides which `isann` the operator's NEXT command runs. An install that
+# wins the folder but loses PATH is WS-03 #6: `isann version` kept printing the
+# old build and nothing said why.
+for n in isann ivm; do
+  p=$(command -v "$n" 2>/dev/null) || continue
+  [ -n "$p" ] && note_found "$p" "on PATH"
+done
+
 # Install root: ALWAYS prompt on run (Enter accepts the default). --root / $ISANN_ROOT
-# only pre-fill the default. Under `curl | sh` stdin IS the script, so read from
-# /dev/tty directly; with no controlling terminal (CI) use the default silently.
-default="${ROOT:-${ISANN_ROOT:-$HOME/isann}}"
+# only pre-fill the default - an answer the operator already gave, though it does
+# not skip the conflict check below. Under `curl | sh` stdin IS the script, so
+# read from /dev/tty directly; with no controlling terminal (CI) use the default.
+default="${ROOT:-${ISANN_ROOT:-${found_root:-$HOME/isann}}}"
 if [ -e /dev/tty ] && [ -r /dev/tty ]; then
   # Say up front that this is not the only prompt. The download and the service
   # registration sit between the two, so someone who walks away comes back to a
   # question still waiting rather than a finished install.
   echo "This asks you two things: the install folder now, and a wallet passphrase at the end." > /dev/tty
   echo "sudo may also ask for your password when the service is registered." > /dev/tty
+  if [ -n "$found_root" ]; then
+    echo "" > /dev/tty
+    echo "This machine already has an iSANN install:" > /dev/tty
+    printf '%s' "$found_why" > /dev/tty
+    echo "Press Enter to use it. Another folder will be refused - one node per machine." > /dev/tty
+  fi
   echo "" > /dev/tty
   printf "install folder [%s]: " "$default" > /dev/tty
   read ans < /dev/tty || ans=""
@@ -107,45 +151,20 @@ gh() {
 }
 
 # --- conflict check, BEFORE anything is downloaded -------------------------
-# Two things name an install folder without root, without ivm and without a
-# single downloaded byte: the isannd unit and PATH. Both are read here so a
-# wrong folder costs one line instead of a 50MB download and an install that
-# then loses every command to whatever PATH already resolves.
+# found_root/found_why were gathered before the folder question, so accepting
+# the offered default lands here with nothing to report. This catches the
+# operator who typed a different folder anyway - including a typo of the right
+# one, which is how this was first hit ("d:\iann" on Windows).
 #
 # The fuller view - every root on disk, their active versions, PATH ORDER - is
 # `ivm doctor`'s job, and it runs from the temp copy after the download but
 # still before anything is written to $ROOT.
-
-# <root>/ivm, or <root>/bin/{isann,isannd}
-install_root() {
-  d=$(dirname "$1")
-  if [ "$(basename "$d")" = "bin" ]; then dirname "$d"; else printf '%s' "$d"; fi
-}
-
 conflict_root=""
 conflict_why=""
-note_conflict() {   # $1 = exe, $2 = label
-  r=$(install_root "$1")
-  [ "${r%/}" = "${ROOT%/}" ] && return 0
-  case "$conflict_why" in *"$r"*) return 0;; esac
-  [ -z "$conflict_root" ] && conflict_root="$r"
-  conflict_why="${conflict_why}    $2: $1
-"
-}
-
-svc_exe=""
-if command -v systemctl >/dev/null 2>&1; then
-  svc_exe=$(systemctl show -p ExecStart --value isannd 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p')
+if [ -n "$found_root" ] && [ "${found_root%/}" != "${ROOT%/}" ]; then
+  conflict_root="$found_root"
+  conflict_why="$found_why"
 fi
-[ -n "$svc_exe" ] && note_conflict "$svc_exe" "service"
-
-# PATH decides which `isann` the next command actually runs. An install that
-# wins the folder but loses PATH is WS-03 #6: `isann version` kept printing the
-# OLD build with nothing saying why.
-for n in isann ivm; do
-  p=$(command -v "$n" 2>/dev/null) || continue
-  [ -n "$p" ] && note_conflict "$p" "on PATH"
-done
 
 if [ -n "$conflict_root" ]; then
   echo ""

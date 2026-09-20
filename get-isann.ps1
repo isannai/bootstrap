@@ -79,13 +79,52 @@ function Read-Answer([string]$Prompt, [string]$Default) {
   return $Default
 }
 
-$default = if ($Root) { $Root } elseif ($env:ISANN_ROOT) { $env:ISANN_ROOT } else { Join-Path $env:LOCALAPPDATA 'isann' }
+# --- where is this machine's iSANN already? --------------------------------
+# Asked BEFORE the folder question, because the answer belongs in the question.
+# Two things name an install without admin, without ivm and without a single
+# downloaded byte: the isannd task and PATH. One iSANN per machine, so if either
+# answers, that folder is the one to offer - typing anything else is a mistake
+# the script would otherwise accept and only refuse several steps later.
+function Get-InstallRoot($exe) {
+  # <root>\ivm.exe, or <root>\bin\{isann,isannd}.exe
+  $dir = Split-Path -Parent $exe
+  if ((Split-Path -Leaf $dir) -ieq 'bin') { Split-Path -Parent $dir } else { $dir }
+}
+
+$found = [ordered]@{}   # root -> what points at it
+$svcExe = $null
+try { $svcExe = (Get-ScheduledTask isannd -ErrorAction SilentlyContinue).Actions[0].Execute } catch { }
+if ($svcExe) { $found[(Get-InstallRoot $svcExe)] = "service  : $svcExe" }
+
+# PATH decides which `isann` the operator's NEXT command runs. An install that
+# wins the folder but loses PATH is WS-03 #6: `isann version` kept printing the
+# old build and nothing said why.
+foreach ($name in @('isann', 'ivm')) {
+  $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $cmd) { continue }
+  $r = Get-InstallRoot $cmd.Source
+  if (-not $found.Contains($r)) { $found[$r] = "on PATH  : $($cmd.Source)" }
+}
+$existing = if ($found.Count -gt 0) { @($found.Keys)[0] } else { $null }
+
+# An explicit --root / $ISANN_ROOT still wins the DEFAULT - it is an answer the
+# operator already gave. It does not skip the conflict check below.
+$default = if ($Root) { $Root }
+           elseif ($env:ISANN_ROOT) { $env:ISANN_ROOT }
+           elseif ($existing) { $existing }
+           else { Join-Path $env:LOCALAPPDATA 'isann' }
 if (Test-Interactive) {
   # Say up front that this is not the only prompt. The download and the service
   # registration sit between the two, so someone who walks away comes back to a
   # question still waiting rather than a finished install.
   Write-Host "This asks you two things: the install folder now, and a wallet passphrase at the end."
   Write-Host "Windows will also raise a UAC prompt when the service is registered."
+  if ($existing) {
+    Write-Host ""
+    Write-Host "This machine already has an iSANN install:"
+    foreach ($k in $found.Keys) { Write-Host "    $($found[$k])" }
+    Write-Host "Press Enter to use it. Another folder will be refused - one node per machine."
+  }
   Write-Host ""
   $Root = Read-Answer "install folder [$default]" $default
 } else {
@@ -136,39 +175,17 @@ function Invoke-Ivm {
 # question before anything is written.)
 
 # --- conflict check, BEFORE anything is downloaded -------------------------
-# Two things on this machine name an install folder without needing admin, ivm,
-# or a single downloaded byte: the isannd task, and PATH. Both are read here so
-# a wrong folder costs the operator one line instead of a 50MB download, a UAC
-# prompt and an install that then loses to whatever PATH already resolves.
+# $found was gathered before the folder question, so accepting the offered
+# default lands here with nothing to report. This catches the operator who
+# typed a different folder anyway - including a typo of the right one, which is
+# how this was first hit ("d:\iann").
 #
 # The fuller view - every root on disk, their active versions, PATH ORDER - is
 # `ivm doctor`'s job, and it runs from the TEMP copy after the download but
 # still before anything is written to $Root.
-function Get-InstallRoot($exe) {
-  # <root>\ivm.exe, or <root>\bin\{isann,isannd}.exe
-  $dir = Split-Path -Parent $exe
-  if ((Split-Path -Leaf $dir) -ieq 'bin') { Split-Path -Parent $dir } else { $dir }
-}
-
-$conflicts = [ordered]@{}   # root -> what points at it
-
-$svcExe = $null
-try { $svcExe = (Get-ScheduledTask isannd -ErrorAction SilentlyContinue).Actions[0].Execute } catch { }
-if ($svcExe) {
-  $r = Get-InstallRoot $svcExe
-  if ($r.TrimEnd('\') -ine $Root.TrimEnd('\')) { $conflicts[$r] = "service  : $svcExe" }
-}
-
-# PATH decides which `isann` the operator's next command actually runs. An
-# install that wins the folder but loses PATH is the exact shape of WS-03 #6:
-# `isann version` kept printing the OLD build and nothing said why.
-foreach ($name in @('isann', 'ivm')) {
-  $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $cmd) { continue }
-  $r = Get-InstallRoot $cmd.Source
-  if ($r.TrimEnd('\') -ine $Root.TrimEnd('\') -and -not $conflicts.Contains($r)) {
-    $conflicts[$r] = "on PATH  : $($cmd.Source)"
-  }
+$conflicts = [ordered]@{}
+foreach ($k in $found.Keys) {
+  if ($k.TrimEnd('\') -ine $Root.TrimEnd('\')) { $conflicts[$k] = $found[$k] }
 }
 
 if ($conflicts.Count -gt 0) {
