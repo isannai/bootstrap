@@ -106,6 +106,33 @@ gh() {
   else curl -fsSL "$@"; fi
 }
 
+# --- conflict check, BEFORE anything is downloaded -------------------------
+# The isannd unit names the install it belongs to, and `systemctl show` needs no
+# root. If it points somewhere other than $ROOT, this install cannot own the
+# service — and the operator should hear that now, not after a 50MB download.
+# PATH order and other install folders need the fuller view `ivm doctor` has;
+# that runs after the download, still before anything is written to $ROOT.
+svc_exe=""
+if command -v systemctl >/dev/null 2>&1; then
+  svc_exe=$(systemctl show -p ExecStart --value isannd 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*//p')
+fi
+if [ -n "$svc_exe" ]; then
+  svc_root=$(dirname "$(dirname "$svc_exe")")
+  if [ "$svc_root" != "$ROOT" ]; then
+    echo ""
+    echo "This machine already runs an iSANN node from another folder:"
+    echo "    service : $svc_exe"
+    echo "    you gave: $ROOT"
+    echo ""
+    echo "  Install into $svc_root instead, or release the service there first:"
+    echo "    $svc_root/ivm service uninstall"
+    echo "  ($svc_root/ivm doctor lists every install on this machine)"
+    echo ""
+    echo "nothing was downloaded."
+    exit 1
+  fi
+fi
+
 owner=isannai; repo=isann
 if [ -n "$VERSION" ]; then
   api="https://api.github.com/repos/${owner}/${repo}/releases/tags/${VERSION}"

@@ -135,6 +135,34 @@ function Invoke-Ivm {
 # elevation, and `ivm doctor` answers the "which install owns the service"
 # question before anything is written.)
 
+# --- conflict check, BEFORE anything is downloaded -------------------------
+# The machine-wide isannd task names the install it belongs to, and reading it
+# needs no admin and no ivm. If it points somewhere other than $Root, this
+# install cannot register a service and the operator would find that out after
+# a 50MB download and a UAC prompt - so it is answered here, first.
+#
+# Only the service is checked here; PATH order and other install folders need
+# the fuller view `ivm doctor` has, and that runs after the download but still
+# BEFORE anything is written to $Root.
+$svcExe = $null
+try { $svcExe = (Get-ScheduledTask isannd -ErrorAction SilentlyContinue).Actions[0].Execute } catch { }
+if ($svcExe) {
+  $svcRoot = Split-Path -Parent (Split-Path -Parent $svcExe)   # <root>in\isannd.exe
+  if ($svcRoot.TrimEnd('') -ine $Root.TrimEnd('')) {
+    Write-Host ""
+    Write-Host "This machine already runs an iSANN node from another folder:"
+    Write-Host "    service : $svcExe"
+    Write-Host "    you gave: $Root"
+    Write-Host ""
+    Write-Host "  Install into $svcRoot instead, or release the service there first:"
+    Write-Host "    `"$svcRoot\ivm.exe`" service uninstall"
+    Write-Host "  (`"$svcRoot\ivm.exe`" doctor lists every install on this machine)"
+    Write-Host ""
+    Write-Host "nothing was downloaded."
+    exit 1
+  }
+}
+
 $owner = 'isannai'; $repo = 'isann'
 $api = if ($Version) { "https://api.github.com/repos/$owner/$repo/releases/tags/$Version" }
        else          { "https://api.github.com/repos/$owner/$repo/releases/latest" }
