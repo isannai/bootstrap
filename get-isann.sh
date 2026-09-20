@@ -107,30 +107,58 @@ gh() {
 }
 
 # --- conflict check, BEFORE anything is downloaded -------------------------
-# The isannd unit names the install it belongs to, and `systemctl show` needs no
-# root. If it points somewhere other than $ROOT, this install cannot own the
-# service — and the operator should hear that now, not after a 50MB download.
-# PATH order and other install folders need the fuller view `ivm doctor` has;
-# that runs after the download, still before anything is written to $ROOT.
+# Two things name an install folder without root, without ivm and without a
+# single downloaded byte: the isannd unit and PATH. Both are read here so a
+# wrong folder costs one line instead of a 50MB download and an install that
+# then loses every command to whatever PATH already resolves.
+#
+# The fuller view - every root on disk, their active versions, PATH ORDER - is
+# `ivm doctor`'s job, and it runs from the temp copy after the download but
+# still before anything is written to $ROOT.
+
+# <root>/ivm, or <root>/bin/{isann,isannd}
+install_root() {
+  d=$(dirname "$1")
+  if [ "$(basename "$d")" = "bin" ]; then dirname "$d"; else printf '%s' "$d"; fi
+}
+
+conflict_root=""
+conflict_why=""
+note_conflict() {   # $1 = exe, $2 = label
+  r=$(install_root "$1")
+  [ "${r%/}" = "${ROOT%/}" ] && return 0
+  case "$conflict_why" in *"$r"*) return 0;; esac
+  [ -z "$conflict_root" ] && conflict_root="$r"
+  conflict_why="${conflict_why}    $2: $1
+"
+}
+
 svc_exe=""
 if command -v systemctl >/dev/null 2>&1; then
   svc_exe=$(systemctl show -p ExecStart --value isannd 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p')
 fi
-if [ -n "$svc_exe" ]; then
-  svc_root=$(dirname "$(dirname "$svc_exe")")
-  if [ "$svc_root" != "$ROOT" ]; then
-    echo ""
-    echo "This machine already runs an iSANN node from another folder:"
-    echo "    service : $svc_exe"
-    echo "    you gave: $ROOT"
-    echo ""
-    echo "  Install into $svc_root instead, or release the service there first:"
-    echo "    $svc_root/ivm service uninstall"
-    echo "  ($svc_root/ivm doctor lists every install on this machine)"
-    echo ""
-    echo "nothing was downloaded."
-    exit 1
-  fi
+[ -n "$svc_exe" ] && note_conflict "$svc_exe" "service"
+
+# PATH decides which `isann` the next command actually runs. An install that
+# wins the folder but loses PATH is WS-03 #6: `isann version` kept printing the
+# OLD build with nothing saying why.
+for n in isann ivm; do
+  p=$(command -v "$n" 2>/dev/null) || continue
+  [ -n "$p" ] && note_conflict "$p" "on PATH"
+done
+
+if [ -n "$conflict_root" ]; then
+  echo ""
+  echo "This machine already has an iSANN install in another folder:"
+  printf '%s' "$conflict_why"
+  echo "    you gave: $ROOT"
+  echo ""
+  echo "  Install into $conflict_root instead, or clear that one out first:"
+  echo "    $conflict_root/ivm uninstall"
+  echo "  ($conflict_root/ivm doctor lists every install on this machine)"
+  echo ""
+  echo "nothing was downloaded."
+  exit 1
 fi
 
 owner=isannai; repo=isann

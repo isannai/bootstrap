@@ -136,37 +136,60 @@ function Invoke-Ivm {
 # question before anything is written.)
 
 # --- conflict check, BEFORE anything is downloaded -------------------------
-# The machine-wide isannd task names the install it belongs to, and reading it
-# needs no admin and no ivm. If it points somewhere other than $Root, this
-# install cannot register a service and the operator would find that out after
-# a 50MB download and a UAC prompt - so it is answered here, first.
+# Two things on this machine name an install folder without needing admin, ivm,
+# or a single downloaded byte: the isannd task, and PATH. Both are read here so
+# a wrong folder costs the operator one line instead of a 50MB download, a UAC
+# prompt and an install that then loses to whatever PATH already resolves.
 #
-# Only the service is checked here; PATH order and other install folders need
-# the fuller view `ivm doctor` has, and that runs after the download but still
-# BEFORE anything is written to $Root.
+# The fuller view - every root on disk, their active versions, PATH ORDER - is
+# `ivm doctor`'s job, and it runs from the TEMP copy after the download but
+# still before anything is written to $Root.
+function Get-InstallRoot($exe) {
+  # <root>\ivm.exe, or <root>\bin\{isann,isannd}.exe
+  $dir = Split-Path -Parent $exe
+  if ((Split-Path -Leaf $dir) -ieq 'bin') { Split-Path -Parent $dir } else { $dir }
+}
+
+$conflicts = [ordered]@{}   # root -> what points at it
+
 $svcExe = $null
 try { $svcExe = (Get-ScheduledTask isannd -ErrorAction SilentlyContinue).Actions[0].Execute } catch { }
 if ($svcExe) {
-  $svcRoot = Split-Path -Parent (Split-Path -Parent $svcExe)   # <root>\bin\isannd.exe
-  if ($svcRoot.TrimEnd('\') -ine $Root.TrimEnd('\')) {
-    Write-Host ""
-    Write-Host "This machine already runs an iSANN node from another folder:"
-    Write-Host "    service : $svcExe"
-    Write-Host "    you gave: $Root"
-    Write-Host ""
-    Write-Host "  Install into $svcRoot instead, or release the service there first:"
-    Write-Host "    `"$svcRoot\ivm.exe`" service uninstall"
-    Write-Host "  (`"$svcRoot\ivm.exe`" doctor lists every install on this machine)"
-    Write-Host ""
-    Write-Host "nothing was downloaded."
-    # `exit` inside `irm | iex` ends the CONSOLE, not just this script: the
-    # operator's window vanishes taking the message above with it - which is
-    # exactly how this stop was first reported as "nothing happens, it just
-    # closes". `return` stops the script and leaves the shell alone; a real
-    # file run still gets the exit code scripts expect.
-    if ($PSCommandPath) { exit 1 }
-    return
+  $r = Get-InstallRoot $svcExe
+  if ($r.TrimEnd('\') -ine $Root.TrimEnd('\')) { $conflicts[$r] = "service  : $svcExe" }
+}
+
+# PATH decides which `isann` the operator's next command actually runs. An
+# install that wins the folder but loses PATH is the exact shape of WS-03 #6:
+# `isann version` kept printing the OLD build and nothing said why.
+foreach ($name in @('isann', 'ivm')) {
+  $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if (-not $cmd) { continue }
+  $r = Get-InstallRoot $cmd.Source
+  if ($r.TrimEnd('\') -ine $Root.TrimEnd('\') -and -not $conflicts.Contains($r)) {
+    $conflicts[$r] = "on PATH  : $($cmd.Source)"
   }
+}
+
+if ($conflicts.Count -gt 0) {
+  $other = @($conflicts.Keys)[0]
+  Write-Host ""
+  Write-Host "This machine already has an iSANN install in another folder:"
+  foreach ($k in $conflicts.Keys) { Write-Host "    $($conflicts[$k])" }
+  Write-Host "    you gave: $Root"
+  Write-Host ""
+  Write-Host "  Install into $other instead, or clear that one out first:"
+  Write-Host "    `"$other\ivm.exe`" uninstall"
+  Write-Host "  (`"$other\ivm.exe`" doctor lists every install on this machine)"
+  Write-Host ""
+  Write-Host "nothing was downloaded."
+  # `exit` inside `irm | iex` ends the CONSOLE, not just this script: the
+  # operator's window vanishes taking the message above with it - which is
+  # exactly how this stop was first reported as "nothing happens, it just
+  # closes". `return` stops the script and leaves the shell alone; a real
+  # file run still gets the exit code scripts expect.
+  if ($PSCommandPath) { exit 1 }
+  return
 }
 
 $owner = 'isannai'; $repo = 'isann'
