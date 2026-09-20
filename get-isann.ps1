@@ -159,7 +159,13 @@ if ($svcExe) {
     Write-Host "  (`"$svcRoot\ivm.exe`" doctor lists every install on this machine)"
     Write-Host ""
     Write-Host "nothing was downloaded."
-    exit 1
+    # `exit` inside `irm | iex` ends the CONSOLE, not just this script: the
+    # operator's window vanishes taking the message above with it - which is
+    # exactly how this stop was first reported as "nothing happens, it just
+    # closes". `return` stops the script and leaves the shell alone; a real
+    # file run still gets the exit code scripts expect.
+    if ($PSCommandPath) { exit 1 }
+    return
   }
 }
 
@@ -216,7 +222,8 @@ try {
     Write-Host ""
     Write-Host "install stopped - nothing was installed. Resolve the conflicts above,"
     Write-Host "or re-run and give the folder this machine already uses."
-    exit 1
+    if ($PSCommandPath) { exit 1 }   # `exit` would close a piped-to-iex console
+    return
   }
 
   # --- place ivm + scripts ---
@@ -290,7 +297,8 @@ if ($Role -ne 'provider') {
     Write-Host ""
     Write-Host "==> finish the elevated window first (including any reboot),"
     Write-Host "    then run this installer again to continue with mesh + wallet."
-    exit 0
+    if ($PSCommandPath) { exit 0 }   # `exit` would close a piped-to-iex console
+    return
   }
 }
 # --- mesh connectors (station, probe) ---
