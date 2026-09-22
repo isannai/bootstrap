@@ -99,6 +99,21 @@ function Get-InstallRoot($exe) {
   if ((Split-Path -Leaf $dir) -ieq 'bin') { Split-Path -Parent $dir } else { $dir }
 }
 
+# Test-LiveInstall separates an install from its leftovers.
+#
+# An uninstall keeps what cannot be downloaded again — the wallet, conf/ — and
+# on Windows it also leaves the running ivm.exe renamed aside. A folder holding
+# only those is not an install, and refusing to install because of one is an
+# accusation nobody can act on: the folder was already deleted, or deliberately
+# emptied, and there is nothing left to "clean up first".
+#
+# bin/ is the test. It holds isannd and isann, it is on the remove list, and
+# nothing an uninstall preserves lives there.
+function Test-LiveInstall($root) {
+  if (-not $root) { return $false }
+  return (Test-Path -LiteralPath (Join-Path $root 'bin'))
+}
+
 $found = [ordered]@{}   # root -> what points at it
 $svcExe = $null
 try { $svcExe = (Get-ScheduledTask isannd -ErrorAction SilentlyContinue).Actions[0].Execute } catch { }
@@ -107,10 +122,19 @@ if ($svcExe) { $found[(Get-InstallRoot $svcExe)] = "service  : $svcExe" }
 # PATH decides which `isann` the operator's NEXT command runs. An install that
 # wins the folder but loses PATH is WS-03 #6: `isann version` kept printing the
 # old build and nothing said why.
+#
+# 🔴 But PATH can name something that is no longer there. A process copies the
+# environment when it STARTS, so the terminal that just ran `ivm uninstall` is
+# still holding the pre-uninstall PATH, and nothing the uninstall does can
+# reach in and correct it. Installing again from that same window was refused
+# for a folder that had already been deleted — an accusation nobody could act
+# on. So a PATH hit is only believed when something is actually there.
 foreach ($name in @('isann', 'ivm')) {
   $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if (-not $cmd) { continue }
+  if (-not (Test-Path -LiteralPath $cmd.Source)) { continue }  # the file itself is gone
   $r = Get-InstallRoot $cmd.Source
+  if (-not (Test-LiveInstall $r)) { continue }                 # leftovers, not an install
   if (-not $found.Contains($r)) { $found[$r] = "on PATH  : $($cmd.Source)" }
 }
 $existing = if ($found.Count -gt 0) { @($found.Keys)[0] } else { $null }

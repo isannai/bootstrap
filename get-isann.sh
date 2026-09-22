@@ -79,9 +79,21 @@ fi
 # PATH decides which `isann` the operator's NEXT command runs. An install that
 # wins the folder but loses PATH is WS-03 #6: `isann version` kept printing the
 # old build and nothing said why.
+# 🔴 A PATH entry can name something that is no longer there. A shell copies
+# the environment when it STARTS, so the terminal that just ran `ivm uninstall`
+# still holds the pre-uninstall PATH and nothing the uninstall does can reach in
+# and correct it. Installing again from that same window was refused over a
+# folder that had already been deleted - an accusation nobody could act on.
+#
+# So a PATH hit is believed only when the folder still looks like an install.
+# bin/ is the test: it holds isannd and isann, it is on the uninstall's remove
+# list, and nothing an uninstall preserves (wallet, conf/) lives there.
 for n in isann ivm; do
   p=$(command -v "$n" 2>/dev/null) || continue
-  [ -n "$p" ] && note_found "$p" "on PATH"
+  [ -n "$p" ] || continue
+  [ -x "$p" ] || continue                       # the file itself is gone
+  [ -d "$(install_root "$p")/bin" ] || continue # leftovers, not an install
+  note_found "$p" "on PATH"
 done
 
 # Install root: ALWAYS prompt on run (Enter accepts the default). --root / $ISANN_ROOT
