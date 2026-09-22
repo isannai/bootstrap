@@ -151,6 +151,39 @@ if (Test-Interactive) {
 # install on a machine that never serves leaves several GB of unused stack.
 if ($null -eq $Role) { $Role = '' }
 $Role = $Role.Trim().ToLower()
+# A re-install must not silently demote a provider. $Role is not carried by the
+# install itself, so it is recorded at the end of this script and read back here
+# - otherwise an operator who just presses Enter lands on the consumer default
+# and every provider-only step below is skipped: the station/probe pull (isannd
+# updates, the mesh apps stay behind, and nothing looks wrong until the two
+# disagree) and the recipe list that says what to run next. Installs made before
+# that file existed have no record, so fall back to the one thing only a
+# provider has: a station. Same idea as the install-folder default above.
+# [IO.Path]::Combine, not Join-Path: Join-Path RESOLVES the drive and throws
+# DriveNotFoundException for a root like D:\isann on a machine with no D: -
+# and $ErrorActionPreference = "Stop" turns that into a dead script before the
+# folder-conflict check below can say anything useful. This is a plain string
+# join. The whole probe is best effort: anything unreadable falls through to
+# the question rather than failing the install.
+$script:roleFile = [IO.Path]::Combine($Root, 'artifacts', 'install-role')
+if (-not $Role) {
+  try {
+    $stationDir = [IO.Path]::Combine($Root, 'artifacts', 'addon', 'meshes', 'station')
+    if (Test-Path -LiteralPath $script:roleFile) {
+      $prev = Get-Content $script:roleFile -TotalCount 1 -ErrorAction SilentlyContinue
+      if ($prev) { $prev = $prev.Trim().ToLower() }
+      if ($prev -in @('consumer', 'provider')) {
+        $Role = $prev
+        Write-Host "existing $Role install - keeping that role"
+      }
+    } elseif (Test-Path -LiteralPath $stationDir) {
+      $Role = 'provider'
+      Write-Host "existing install has a station - assuming role=provider"
+    }
+  } catch {
+    # unreachable/nonexistent drive, permissions, a corrupt file - ask instead
+  }
+}
 if ($Role -notin @('consumer', 'provider')) {
   if (Test-Interactive) {
     Write-Host ""
@@ -302,6 +335,17 @@ try {
     # of `service status`, because the elevated window was fire-and-forget and its
     # result never came back. Both are gone with the wait.
     Invoke-Ivm use --version $tag                    # switch (+ register) -> running
+
+    # Record the role so the next run does not have to ask again. After
+    # `ivm use` because artifacts\ only exists once ivm has initialised. Never
+    # fatal: a node that runs but forgot its role costs a re-ask, not a broken
+    # install.
+    try {
+      New-Item -ItemType Directory -Force -Path (Split-Path $script:roleFile) | Out-Null
+      Set-Content -Path $script:roleFile -Value $Role -Encoding utf8
+    } catch {
+      Write-Host "note: could not record the role in $script:roleFile"
+    }
   } finally { Pop-Location }
 } finally {
   Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue

@@ -119,6 +119,30 @@ fi
 # The default is consumer because it is the cheaper mistake: a consumer that
 # later wants to share runs `ivm setup` + `isann mesh pull`, whereas a provider
 # install on a machine that never serves leaves several GB of unused stack.
+# A re-install must not silently demote a provider. ROLE is not carried by the
+# install itself, so it is recorded at the end of this script and read back
+# here - otherwise an operator who just presses Enter lands on the consumer
+# default and every provider-only step below is skipped: the station/probe pull
+# (isannd updates, the mesh apps stay behind, and nothing looks wrong until the
+# two disagree) and the recipe list that says what to run next. Installs made
+# before that file existed have no record, so fall back to the one thing only a
+# provider has: a station. Same idea as the install-folder default above.
+ROLE_FILE="$ROOT/artifacts/install-role"
+if [ -z "$ROLE" ]; then
+  if [ -r "$ROLE_FILE" ]; then
+    # head -n 1, then a prefix match: a stray CR from an edited file still
+    # matches, and anything else simply falls through to the question below.
+    case "$(head -n 1 "$ROLE_FILE" 2>/dev/null)" in
+      consumer*) ROLE=consumer ;;
+      provider*) ROLE=provider ;;
+    esac
+    [ -n "$ROLE" ] && echo "existing $ROLE install - keeping that role"
+  elif [ -d "$ROOT/artifacts/addon/meshes/station" ]; then
+    ROLE=provider
+    echo "existing install has a station - assuming role=provider"
+  fi
+fi
+
 case "$ROLE" in
   consumer|provider) ;;
   *)
@@ -260,6 +284,13 @@ cd "$ROOT"
 # starts the unit when there is none, and stops/restarts it when there is.
 # (The separate `ivm service install` that stood here is gone with that merge.)
 ./ivm use --version "$tag"               # switch (+ register) -> running
+
+# Record the role so the next run does not have to ask again. After `ivm use`
+# because artifacts/ only exists once ivm has initialised. Never fatal: a node
+# that runs but forgot its role costs a re-ask, not a broken install.
+mkdir -p "$ROOT/artifacts" 2>/dev/null &&
+  echo "$ROLE" > "$ROLE_FILE" 2>/dev/null ||
+  echo "note: could not record the role in $ROLE_FILE"
 
 echo
 echo "iSANN node ready at $ROOT"
