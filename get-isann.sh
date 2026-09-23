@@ -10,6 +10,11 @@
 # --role=provider, by running `ivm setup` once ivm is in place. A consumer node
 # calls other nodes and runs nothing locally, so it skips all of it.
 #
+# A PROVIDER NEEDS AN NVIDIA GPU. The engines only start as GPU containers and
+# there is no CPU-only engine path, so a machine without one can install the
+# whole stack and still serve nobody. This script checks before it asks, and
+# steers a GPU-less machine to consumer. A consumer needs no GPU at all.
+#
 #   curl -fsSL https://<host>/get-isann.sh | sh                                   # default folder
 #   curl -fsSL https://<host>/get-isann.sh | sh -s -- --root=/opt/isann           # pick the folder (flag)
 #   curl -fsSL https://<host>/get-isann.sh | ISANN_ROOT=/opt/isann sh             # pick the folder (env)
@@ -21,7 +26,10 @@
 #   --version=<tag>    pin a release tag (default: latest)
 #   --role=<r>         consumer | provider. Skips the role question. A consumer
 #                      node only CALLS other nodes, so it needs no station, no
-#                      probe, no Docker, no GPU. Default when not asked: consumer
+#                      probe, no Docker, no GPU. Default when not asked: consumer.
+#                      provider REQUIRES an NVIDIA GPU — passing it on a machine
+#                      without one installs the stack and warns, but no engine
+#                      will start.
 #   --token=<tok>      GitHub token (only if you hit the anonymous rate limit)
 set -eu
 
@@ -30,7 +38,7 @@ set -eu
 # cached copy from this morning look identical while behaving differently. Bump
 # this line in the same commit that changes behaviour. It is the script's own
 # version, unrelated to the ivm/isannd release it installs.
-SCRIPT_VERSION='2026-09-20.4'
+SCRIPT_VERSION='2026-09-23.1'
 echo "get-isann $SCRIPT_VERSION  (installer script)"
 
 ROOT=""
@@ -155,6 +163,30 @@ if [ -z "$ROLE" ]; then
   fi
 fi
 
+# Is there an NVIDIA GPU here? A provider serves inference, the engines only
+# start as GPU containers, and there is no CPU-only engine path - so this
+# decides whether the provider role is worth offering at all.
+#
+# Asked BEFORE the role question on purpose. Without it a GPU-less machine
+# installs Docker, the service and the firewall rules, finishes looking
+# successful, and only fails later when a recipe's `requires:` refuses - by
+# which point the whole stack is paid for and the node can serve nobody.
+#
+# nvidia-smi answers "the driver works"; /proc/driver/nvidia and lspci answer
+# "the card is there". A card with no driver is fixable, so it counts as a yes
+# and `ivm setup` says what to install. Every probe is best effort.
+has_nvidia() {
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1 && return 0
+  fi
+  [ -d /proc/driver/nvidia ] && return 0
+  if command -v lspci >/dev/null 2>&1; then
+    lspci 2>/dev/null | grep -qi 'nvidia' && return 0
+  fi
+  return 1
+}
+if has_nvidia; then HAS_NVIDIA=1; else HAS_NVIDIA=0; fi
+
 case "$ROLE" in
   consumer|provider) ;;
   *)
@@ -162,16 +194,49 @@ case "$ROLE" in
       echo "" > /dev/tty
       echo "what will this node do?" > /dev/tty
       echo "  1) consumer - use other nodes only      (default)" > /dev/tty
-      echo "  2) provider - also serve inference to others" > /dev/tty
+      if [ "$HAS_NVIDIA" = "1" ]; then
+        echo "  2) provider - also serve inference to others" > /dev/tty
+      else
+        echo "  2) provider - also serve inference to others   [NOT USABLE on this PC]" > /dev/tty
+        echo "" > /dev/tty
+        echo "     No NVIDIA GPU was found here. The engines only run in GPU containers," > /dev/tty
+        echo "     so this machine cannot serve inference no matter what is installed." > /dev/tty
+        echo "     A consumer node calls other people's nodes and needs no GPU." > /dev/tty
+      fi
       printf "choice [1]: " > /dev/tty
       read choice < /dev/tty || choice=""
-      if [ "$choice" = "2" ]; then ROLE="provider"; else ROLE="consumer"; fi
+      if [ "$choice" = "2" ] && [ "$HAS_NVIDIA" != "1" ]; then
+        # Not a hard block: the card may be sitting there with no driver yet, or
+        # arriving tomorrow. But it has to be a deliberate act rather than a
+        # keypress, and they have to have read why.
+        echo "" > /dev/tty
+        echo "  provider on a machine with no NVIDIA GPU installs Docker and the service," > /dev/tty
+        echo "  and still cannot start an engine. Type 'provider' to do it anyway" > /dev/tty
+        echo "  (e.g. the GPU is not here yet), or press Enter for consumer." > /dev/tty
+        printf "  role []: " > /dev/tty
+        read confirm < /dev/tty || confirm=""
+        if [ "$confirm" = "provider" ]; then ROLE="provider"; else ROLE="consumer"; fi
+      elif [ "$choice" = "2" ]; then
+        ROLE="provider"
+      else
+        ROLE="consumer"
+      fi
     else
       ROLE="consumer"
     fi
     ;;
 esac
 echo "role: $ROLE"
+# An explicit --role=provider skips the question entirely, so say it here too -
+# a scripted install on the wrong machine should leave a reason in the log
+# instead of a node that quietly serves nobody.
+if [ "$ROLE" = "provider" ] && [ "$HAS_NVIDIA" != "1" ]; then
+  echo ""
+  echo "[!] No NVIDIA GPU found. This node will install the full provider stack but"
+  echo "    cannot start an engine - the engines only run in GPU containers."
+  echo "    Install the NVIDIA driver and re-run, or use --role=consumer."
+  echo ""
+fi
 
 # --- platform -------------------------------------------------------------
 case "$(uname -s)" in

@@ -11,6 +11,11 @@
   calls other nodes and runs nothing locally, so it skips all of it and finishes
   in a minute or two.
 
+  A PROVIDER NEEDS AN NVIDIA GPU. The engines only start as GPU containers and
+  there is no CPU-only engine path, so a machine without one can install the
+  whole stack and still serve nobody. This script checks before it asks, and
+  steers a GPU-less machine to consumer. A consumer needs no GPU at all.
+
     # in a PowerShell window:
     irm https://<host>/get-isann.ps1 | iex                                  # default folder
     $env:ISANN_ROOT='C:\isann'; irm https://<host>/get-isann.ps1 | iex      # pick the folder (piped)
@@ -27,7 +32,10 @@
     --version=<tag>   pin a release tag (default: latest)
     --role=<r>        consumer | provider. Skips the role question. A consumer
                       node only CALLS other nodes, so it needs no station, no
-                      probe, no WSL/Docker/GPU. Default when not asked: consumer
+                      probe, no WSL/Docker/GPU. Default when not asked: consumer.
+                      provider REQUIRES an NVIDIA GPU — passing it on a machine
+                      without one installs the stack and warns, but no engine
+                      will start.
     --token=<tok>     GitHub token (only if you hit the anonymous rate limit)
 #>
 # PositionalBinding=$false is what actually makes the --xxx=yyy catcher below
@@ -64,7 +72,7 @@ $ProgressPreference    = 'SilentlyContinue'   # faster Invoke-WebRequest
 # cached copy from this morning look identical while behaving differently. Bump
 # this line in the same commit that changes behaviour. It is the script's own
 # version, unrelated to the ivm/isannd release it installs.
-$ScriptVersion = '2026-09-20.4'
+$ScriptVersion = '2026-09-23.1'
 Write-Host "get-isann $ScriptVersion  (installer script)"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -85,6 +93,95 @@ function Read-Answer([string]$Prompt, [string]$Default) {
   try { $a = Read-Host $Prompt } catch { return $Default }
   if ($a) { return $a }
   return $Default
+}
+
+# Is there an NVIDIA GPU on this machine? A provider serves inference, the
+# engines only start as GPU containers, and there is no CPU-only engine path -
+# so this answer decides whether the provider role is worth offering at all.
+#
+# Asked BEFORE the role question on purpose. Without it a GPU-less machine
+# installs WSL, Docker, the service and the firewall rules, finishes looking
+# successful, and only fails several steps later when a recipe's `requires:`
+# refuses - by which point the operator has paid for the whole stack and has a
+# node that cannot serve anyone.
+#
+# Two probes, because they answer different questions and either one is enough
+# to keep the door open:
+#   nvidia-smi            the DRIVER is installed and working
+#   Win32_VideoController the CARD is present (driver may still be missing)
+# A card with no driver is a fixable situation, so it counts as a yes here and
+# `ivm setup` says what to install. Everything is best effort: a probe that
+# throws must not take the install with it.
+function Test-NvidiaGpu {
+  try {
+    $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if ($smi) {
+      & $smi.Source --query-gpu=name --format=csv,noheader 2>$null | Out-Null
+      if ($LASTEXITCODE -eq 0) { return $true }
+    }
+  } catch { }
+  try {
+    $gpus = Get-CimInstance Win32_VideoController -ErrorAction Stop
+    foreach ($g in $gpus) {
+      if ($g.Name -match 'NVIDIA') { return $true }
+    }
+  } catch { }
+  return $false
+}
+
+# Wake a stopped WSL so docker can actually be probed.
+#
+# `ivm check` deliberately will not do this - being read-only is the whole value
+# of that command - so whoever wants a real answer has to ask for one first.
+#
+# `isann docker warmup` is what the check's own message recommends and it starts
+# dockerd as well as the distro, but it needs an UNLOCKED WALLET:
+#
+#   isann: docker warmup: session expired or locked - run: isann auth unlock
+#
+# and a fresh install has no wallet at this point - it is created several steps
+# later. So warmup is tried and its failure is expected, not fatal: waking the
+# distro directly is enough, because dockerd comes up with it on a machine where
+# `ivm setup` has already run. Anything that throws must not take the install
+# down with it - this function's whole job is to make the NEXT check truthful.
+function Start-WslForProbe {
+  if ($script:isann -and (Test-Path -LiteralPath $script:isann)) {
+    & $script:isann docker warmup *> $null
+    if ($LASTEXITCODE -eq 0) { return }
+  }
+  try { & wsl.exe -e true *> $null } catch { }
+}
+
+# `ivm check`, but with the one thing the check will not do for itself: wake a
+# stopped WSL and then wait for an answer.
+#
+# Three codes come back - 0 ready, 3 unknown (WSL down), 1 missing - and only
+# the first two can be settled here. Returns the last code seen.
+#
+# The wait is the part that is easy to leave out and wrong to. dockerd does not
+# answer the moment the distro is up. Asking once, five seconds in, reports
+# "Docker Engine: not installed" for an engine that is installed and starting -
+# and that answer sends the operator into `ivm setup` for software they already
+# have, which is the loop this whole function exists to break.
+#
+# The budget is generous on purpose. A cold distro start measured 55s here, and
+# the cost of waiting too long is a slow install while the cost of giving up too
+# early is an unnecessary elevated window and a re-run. Anyone watching sees the
+# "waking it" line, so the wait is not silent.
+function Invoke-PrereqCheck {
+  & $script:ivm check *> $null
+  if ($LASTEXITCODE -ne 3) { return $LASTEXITCODE }
+
+  Write-Host "prereqs: WSL is idle - waking it to check docker (can take a minute)"
+  Start-WslForProbe
+  $last = 3
+  for ($i = 0; $i -lt 36; $i++) {   # up to ~3 min
+    Start-Sleep -Seconds 5
+    & $script:ivm check *> $null
+    $last = $LASTEXITCODE
+    if ($last -eq 0) { return 0 }
+  }
+  return $last
 }
 
 # --- where is this machine's iSANN already? --------------------------------
@@ -208,19 +305,55 @@ if (-not $Role) {
     # unreachable/nonexistent drive, permissions, a corrupt file - ask instead
   }
 }
+# One probe, reused by the question below and by the warning for an explicit
+# --role=provider. nvidia-smi and CIM are both slow enough to be worth not
+# running twice.
+$script:hasNvidia = Test-NvidiaGpu
+
 if ($Role -notin @('consumer', 'provider')) {
   if (Test-Interactive) {
     Write-Host ""
     Write-Host "what will this node do?"
     Write-Host "  1) consumer - use other nodes only      (default)"
-    Write-Host "  2) provider - also serve inference to others"
+    if ($script:hasNvidia) {
+      Write-Host "  2) provider - also serve inference to others"
+    } else {
+      Write-Host "  2) provider - also serve inference to others   [NOT USABLE on this PC]"
+      Write-Host ""
+      Write-Host "     No NVIDIA GPU was found here. The engines only run in GPU containers,"
+      Write-Host "     so this machine cannot serve inference no matter what is installed."
+      Write-Host "     A consumer node calls other people's nodes and needs no GPU."
+    }
     $ans = Read-Answer "choice [1]" '1'
-    $Role = if ($ans -eq '2') { 'provider' } else { 'consumer' }
+    if ($ans -eq '2' -and -not $script:hasNvidia) {
+      # Not a hard block: a card can be sitting in the machine with no driver
+      # yet, and the operator may be installing ahead of hardware that arrives
+      # tomorrow. But it must be a deliberate act rather than a keypress, and
+      # they have to have read why.
+      Write-Host ""
+      Write-Host "  provider on a machine with no NVIDIA GPU installs WSL, Docker and the"
+      Write-Host "  service, and still cannot start an engine. Type 'provider' to do it"
+      Write-Host "  anyway (e.g. the GPU is not here yet), or press Enter for consumer."
+      $confirm = Read-Answer "  role []" ''
+      $Role = if ($confirm.Trim().ToLower() -eq 'provider') { 'provider' } else { 'consumer' }
+    } else {
+      $Role = if ($ans -eq '2') { 'provider' } else { 'consumer' }
+    }
   } else {
     $Role = 'consumer'
   }
 }
 Write-Host "role: $Role"
+# An explicit --role=provider skips the question entirely, so say it here too -
+# a scripted install on the wrong machine should still leave a reason in the log
+# instead of a node that quietly serves nobody.
+if ($Role -eq 'provider' -and -not $script:hasNvidia) {
+  Write-Host ""
+  Write-Host "[!] No NVIDIA GPU found. This node will install the full provider stack but"
+  Write-Host "    cannot start an engine - the engines only run in GPU containers."
+  Write-Host "    Install the NVIDIA driver and re-run, or use --role=consumer."
+  Write-Host ""
+}
 
 if (-not [Environment]::Is64BitOperatingSystem) { throw "64-bit Windows is required" }
 $asset = "ivm-windows-amd64.zip"
@@ -334,6 +467,10 @@ try {
   # --- place ivm + scripts ---
   New-Item -ItemType Directory -Force -Path $Root | Out-Null
   $script:ivm = Join-Path $Root 'ivm.exe'
+  # The CLI lands here once `ivm use` has unpacked the suite. Needed by the
+  # prereq block further down, which wakes a stopped WSL with `isann docker
+  # warmup` before deciding anything about docker.
+  $script:isann = Join-Path $Root 'bin\isann.exe'
   # The old `ivm service stop` that stood here is gone. It ran the SAME ivm.exe
   # this line is about to overwrite - in an elevated window ivm does not wait
   # for - so the copy below hit "file in use" depending on how fast UAC was
@@ -396,8 +533,18 @@ if (($env:Path -split ';') -notcontains $binPath) { $env:Path = "$binPath;$env:P
 if ($Role -ne 'provider') {
   Write-Host "prereqs: not needed - a consumer node runs no engines locally"
 } else {
-  & $script:ivm check *> $null
-  if ($LASTEXITCODE -eq 0) {
+  # `ivm check` answers three ways, and they are not interchangeable:
+  #   0  ready
+  #   3  UNKNOWN - WSL is stopped, so docker could not be asked
+  #   1  genuinely missing - `ivm setup` has work to do
+  #
+  # 3 used to come back as 1, and this block read it as "nothing is installed":
+  # it opened an elevated window that skipped every step (all of it was already
+  # there), told the operator to re-run, and by then WSL had gone idle again -
+  # so the next run landed on exactly the same line. mesh and the wallet were
+  # never reached at all. The fix is to wake WSL and ask again, which is what
+  # the check's own message has been saying all along.
+  if ((Invoke-PrereqCheck) -eq 0) {
     Write-Host "prereqs: OK (WSL / Docker / toolkit present)"
   } else {
     Write-Host ""
@@ -405,16 +552,22 @@ if ($Role -ne 'provider') {
     Write-Host "    this asks for admin and may reboot; Docker finishes after the restart."
     & $script:ivm setup
     # On Windows `ivm setup` only TRIGGERS the elevated window and returns 0 at
-    # once, so $LASTEXITCODE cannot report whether WSL/Docker finished - and the
-    # first WSL enable needs a reboot anyway. Stop here instead of racing ahead
-    # into mesh pull and the wallet prompt on top of an installer that is still
-    # running in another window. Re-running resumes: everything already done is
-    # skipped and `ivm check` then passes straight through.
-    Write-Host ""
-    Write-Host "==> finish the elevated window first (including any reboot),"
-    Write-Host "    then run this installer again to continue with mesh + wallet."
-    if ($PSCommandPath) { exit 0 }   # `exit` would close a piped-to-iex console
-    return
+    # once, so $LASTEXITCODE cannot report whether WSL/Docker finished. Ask the
+    # question that can be answered instead: check again. If the elevated window
+    # had nothing to do - or finished while we waited - this run carries on into
+    # mesh + wallet rather than sending the operator round again for nothing.
+    if ((Invoke-PrereqCheck) -eq 0) {
+      Write-Host "prereqs: OK (already in place)"
+    } else {
+      # Still not ready: the elevated window is doing real work, or a reboot is
+      # pending. Stop rather than racing ahead into mesh pull and the wallet
+      # prompt on top of an installer still running in another window.
+      Write-Host ""
+      Write-Host "==> finish the elevated window first (including any reboot),"
+      Write-Host "    then run this installer again to continue with mesh + wallet."
+      if ($PSCommandPath) { exit 0 }   # `exit` would close a piped-to-iex console
+      return
+    }
   }
 }
 # --- mesh connectors (station, probe) ---
