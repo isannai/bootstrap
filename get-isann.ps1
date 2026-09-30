@@ -72,7 +72,7 @@ $ProgressPreference    = 'SilentlyContinue'   # faster Invoke-WebRequest
 # cached copy from this morning look identical while behaving differently. Bump
 # this line in the same commit that changes behaviour. It is the script's own
 # version, unrelated to the ivm/isannd release it installs.
-$ScriptVersion = '2026-09-23.1'
+$ScriptVersion = '2026-09-30.1'
 Write-Host "get-isann $ScriptVersion  (installer script)"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -93,6 +93,29 @@ function Read-Answer([string]$Prompt, [string]$Default) {
   try { $a = Read-Host $Prompt } catch { return $Default }
   if ($a) { return $a }
   return $Default
+}
+
+# Run a native exe whose failure is an expected, handled outcome - a probe, a
+# wake-up nudge - and return its exit code, or -1 when it could not be run at
+# all. Nothing it prints reaches the screen.
+#
+# `*> $null` alone does not do this on Windows PowerShell 5.1. Once stderr is
+# redirected, every line the exe writes there becomes a NativeCommandError
+# record, and the script-wide $ErrorActionPreference = 'Stop' turns the first
+# one into a terminating error: a red block that looks fatal, then a dead
+# install - even though the caller was ready for the exe to fail. try/catch
+# alone keeps the script alive but jumps out at that first line, so the exit
+# code the caller branches on is never looked at.
+#
+# So the preference is relaxed here, for this call only (it is function scope;
+# the script keeps 'Stop'), and try/catch covers whatever still throws - the
+# exe missing, for one. Use it only where failure is a normal path; a step that
+# must succeed goes through Invoke-Ivm or checks $LASTEXITCODE itself.
+function Invoke-Soft([string]$Exe, [string[]]$ArgList) {
+  $ErrorActionPreference = 'SilentlyContinue'
+  $global:LASTEXITCODE = -1
+  try { & $Exe @ArgList *> $null } catch { return -1 }
+  return $global:LASTEXITCODE
 }
 
 # Is there an NVIDIA GPU on this machine? A provider serves inference, the
@@ -116,8 +139,8 @@ function Test-NvidiaGpu {
   try {
     $smi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
     if ($smi) {
-      & $smi.Source --query-gpu=name --format=csv,noheader 2>$null | Out-Null
-      if ($LASTEXITCODE -eq 0) { return $true }
+      # Soft: a driver that warns on stderr is still a working driver.
+      if ((Invoke-Soft $smi.Source @('--query-gpu=name', '--format=csv,noheader')) -eq 0) { return $true }
     }
   } catch { }
   try {
@@ -144,12 +167,15 @@ function Test-NvidiaGpu {
 # distro directly is enough, because dockerd comes up with it on a machine where
 # `ivm setup` has already run. Anything that throws must not take the install
 # down with it - this function's whole job is to make the NEXT check truthful.
+#
+# Warmup fails for other reasons too: on a re-run isannd may not be listening
+# on 127.0.0.1:8443 yet (connection refused). Whatever the reason, it goes
+# through Invoke-Soft - quiet, never fatal - and the distro is woken directly.
 function Start-WslForProbe {
   if ($script:isann -and (Test-Path -LiteralPath $script:isann)) {
-    & $script:isann docker warmup *> $null
-    if ($LASTEXITCODE -eq 0) { return }
+    if ((Invoke-Soft $script:isann @('docker', 'warmup')) -eq 0) { return }
   }
-  try { & wsl.exe -e true *> $null } catch { }
+  Invoke-Soft 'wsl.exe' @('-e', 'true') | Out-Null
 }
 
 # `ivm check`, but with the one thing the check will not do for itself: wake a
@@ -169,16 +195,16 @@ function Start-WslForProbe {
 # early is an unnecessary elevated window and a re-run. Anyone watching sees the
 # "waking it" line, so the wait is not silent.
 function Invoke-PrereqCheck {
-  & $script:ivm check *> $null
-  if ($LASTEXITCODE -ne 3) { return $LASTEXITCODE }
+  # The answer is the exit code; anything check writes is not for this screen.
+  $code = Invoke-Soft $script:ivm @('check')
+  if ($code -ne 3) { return $code }
 
   Write-Host "prereqs: WSL is idle - waking it to check docker (can take a minute)"
   Start-WslForProbe
   $last = 3
   for ($i = 0; $i -lt 36; $i++) {   # up to ~3 min
     Start-Sleep -Seconds 5
-    & $script:ivm check *> $null
-    $last = $LASTEXITCODE
+    $last = Invoke-Soft $script:ivm @('check')
     if ($last -eq 0) { return 0 }
   }
   return $last
