@@ -259,6 +259,26 @@ gh() {
   else curl -fsSL "$@"; fi
 }
 
+# asset_digest NAME JSON - the sha256 GitHub records for one asset of a release
+# (its "digest"), or nothing. Read without jq: jq is not on a stock Linux, and
+# leaving the check to it meant most installs were never checked (SEC-18).
+# Every key goes on its own line; a "name" line opens the asset it names, and
+# the first digest after it is that asset's (its uploader block has no "name").
+asset_digest() {
+  printf '%s' "$2" | tr ',{}' '\n\n\n' | awk -v a="\"$1\"" '
+    /"name"[[:space:]]*:/ { inside = (index($0, a) > 0) }
+    inside && /"digest"[[:space:]]*:/ {
+      if (match($0, /sha256:[0-9a-fA-F]+/)) { print tolower(substr($0, RSTART + 7, RLENGTH - 7)); exit }
+    }'
+}
+
+# sha256_file FILE - its sha256, or nothing when the machine has no tool for it.
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
 # --- conflict check, BEFORE anything is downloaded -------------------------
 # found_root/found_why were gathered before the folder question, so accepting
 # the offered default lands here with nothing to report. This catches the
@@ -309,16 +329,20 @@ trap 'rm -rf "$tmp"' EXIT
 tgz="$tmp/$asset"
 gh "$url" -o "$tgz"
 
-# Integrity: precise sha256 when jq is present, else trust HTTPS — the SUITE
-# (the large payload) is re-verified by `ivm install` against its own digest.
-if command -v jq >/dev/null 2>&1; then
-  want="$(printf '%s' "$json" | jq -r ".assets[] | select(.name==\"$asset\") | .digest" | sed 's/^sha256://')"
-  if [ -n "$want" ] && [ "$want" != "null" ]; then
-    if command -v sha256sum >/dev/null 2>&1; then have="$(sha256sum "$tgz" | cut -d' ' -f1)"
-    else have="$(shasum -a 256 "$tgz" | cut -d' ' -f1)"; fi
-    [ "$want" = "$have" ] || { echo "sha256 mismatch: want $want have $have" >&2; exit 1; }
-    echo "==> sha256 ok"
-  fi
+# Integrity: the release's own sha256 for this asset. The SUITE (the large
+# payload) is re-verified by `ivm install` against its own digest. When there is
+# nothing to check against, or nothing to check with, say so (as get-isann.ps1
+# does) rather than install as if it had been checked.
+want="$(asset_digest "$asset" "$json")"
+have="$(sha256_file "$tgz")"
+if [ -z "$want" ]; then
+  echo "==> WARNING: release ships no sha256 digest for $asset - integrity NOT verified" >&2
+elif [ -z "$have" ]; then
+  echo "==> WARNING: no sha256sum or shasum on this machine - integrity NOT verified" >&2
+elif [ "$want" != "$have" ]; then
+  echo "sha256 mismatch: want $want have $have" >&2; exit 1
+else
+  echo "==> sha256 ok"
 fi
 
 ( cd "$tmp" && tar xf "$tgz" )   # extract (system tar; exec bit set explicitly below)
@@ -408,10 +432,22 @@ ISANN="$ROOT/bin/isann"
 if [ "$ROLE" != "provider" ]; then
   echo "consumer node - skipping station/probe (add them later with: isann mesh pull ...)"
 elif [ -x "$ISANN" ]; then
+  # The release's own asset URL and sha256, so `mesh pull` checks what it got.
+  # If the release cannot be read (rate limit), fall back to latest/download and
+  # say the pull is unchecked.
+  mesh_json="$(gh "https://api.github.com/repos/isannai/mesh/releases/latest" 2>/dev/null || true)"
   for m in station probe; do
-    url="https://github.com/isannai/mesh/releases/latest/download/$m-linux-amd64.tar.gz"
+    masset="$m-linux-amd64.tar.gz"
+    url="$(printf '%s' "$mesh_json" | grep -o "https://[^\"]*/${masset}" | head -1)"
+    sum="$(asset_digest "$masset" "$mesh_json")"
+    [ -n "$url" ] || url="https://github.com/isannai/mesh/releases/latest/download/$masset"
     echo "==> mesh pull $m"
-    if ! "$ISANN" mesh pull "$url" --name "$m" -force; then
+    if [ -n "$sum" ]; then set -- --sha256 "$sum"
+    else
+      echo "    WARNING: no sha256 digest for $masset - integrity NOT verified" >&2
+      set --
+    fi
+    if ! "$ISANN" mesh pull "$url" --name "$m" -force "$@"; then
       echo "    $m pull failed - install it later with:  isann mesh pull $url --name $m"
     fi
   done
